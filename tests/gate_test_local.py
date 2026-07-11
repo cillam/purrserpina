@@ -1,98 +1,103 @@
 #!/usr/bin/env python3
+"""Bench test: the LOCAL person-gate — snap -> MobileNet-SSD "is someone there?"
+
+The race winner from log 05: a few hundred ms, no network, no API cost.
+Prints the best person-confidence score each pass — that score is the tuning
+dial for CONFIDENCE (currently 0.50). Lower it if real people at porch
+distance score low while empty frames stay near zero.
+
+Integration seam: person_present() -> bool is exactly what the brain will
+import/copy — swap the detector later without touching anything else.
+
+Model files (one-time download, ~4 MB, offline forever after):
+  assets/models/detect.tflite
+  assets/models/labelmap.txt
+(from the coco_ssd_mobilenet_v1_1.0_quant zip — see README asset manifest)
+
+Deps: ai-edge-litert (pip, --break-system-packages), python3-pil (apt).
+
+Run from anywhere:  python3 tests/gate_test_local.py
 """
-gate_test_local.py -- Purrserpina camera gate, fully local version.
-
-Same job as gate_test.py (snap -> "is there a person?" -> verdict + timing),
-but the detector runs on the Pi itself: no network, no API cost.
-
-One-time setup on the Pi:
-
-    pip install --break-system-packages ai-edge-litert
-    mkdir -p ~/purr-models && cd ~/purr-models
-    wget https://storage.googleapis.com/download.tensorflow.org/models/tflite/coco_ssd_mobilenet_v1_1.0_quant_2018_06_29.zip
-    unzip coco_ssd_mobilenet_v1_1.0_quant_2018_06_29.zip
-    # gives detect.tflite + labelmap.txt
-
-Press Enter to snap again (camera stays warm), Ctrl+C to quit.
-"""
-
-import os
 import time
+from pathlib import Path
 
 import numpy as np
-from picamera2 import Picamera2
 from PIL import Image
+from picamera2 import Picamera2
 
-try:                                     # LiteRT: current package, new Pythons
+# tflite-runtime is dead; LiteRT is the successor. Same model files, new package.
+try:
     from ai_edge_litert.interpreter import Interpreter
-except ImportError:                      # legacy name, Python <= 3.11 only
+except ImportError:                                  # older installs
     from tflite_runtime.interpreter import Interpreter
 
-MODEL_DIR = os.path.expanduser("~/purr-models")
-MODEL_PATH = os.path.join(MODEL_DIR, "detect.tflite")
-LABEL_PATH = os.path.join(MODEL_DIR, "labelmap.txt")
+# --- repo anchoring (tests/ lives one level below the repo root) -------------
+ROOT = Path(__file__).resolve().parent.parent
+MODELS = ROOT / "assets" / "models"
+MODEL_FILE = MODELS / "detect.tflite"
+LABEL_FILE = MODELS / "labelmap.txt"
 
-GATE_SIZE = (1280, 720)   # capture size -- match gate_test.py for a fair race
-CONFIDENCE = 0.50          # min score to count a detection as a person
+# --- tuning -------------------------------------------------------------------
+CONFIDENCE = 0.50        # the dial: person score >= this counts as "someone there"
+SNAP_SIZE = (1280, 720)  # capture size; model input is resized to 300x300 below
+LOOP_PAUSE = 1.0         # seconds between passes while bench testing
 
-# --- labels ---
-with open(LABEL_PATH) as f:
-    labels = [line.strip() for line in f]
-if labels and labels[0] == "???":   # some copies have a placeholder first row
-    labels = labels[1:]
-PERSON_IDS = {i for i, name in enumerate(labels) if name == "person"}
+# --- model setup ---------------------------------------------------------------
+if not MODEL_FILE.exists():
+    raise SystemExit(
+        f"Model not found: {MODEL_FILE}\n"
+        "Download coco_ssd_mobilenet_v1_1.0_quant and unzip detect.tflite + "
+        "labelmap.txt into assets/models/ (see README asset manifest)."
+    )
 
-# --- detector setup (once) ---
-interpreter = Interpreter(model_path=MODEL_PATH, num_threads=4)
+labels = [line.strip() for line in LABEL_FILE.read_text().splitlines()]
+# Some labelmaps start with a '???' placeholder row; find "person" by name.
+PERSON_ID = labels.index("person")
+
+interpreter = Interpreter(model_path=str(MODEL_FILE), num_threads=4)
 interpreter.allocate_tensors()
-inp = interpreter.get_input_details()[0]
-outs = interpreter.get_output_details()
-_, in_h, in_w, _ = inp["shape"]      # 300x300 for this model
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
 
-# --- camera setup (once; stays warm across snaps) ---
-cam = Picamera2()
-config = cam.create_still_configuration(main={"size": GATE_SIZE})
-cam.configure(config)
-cam.start()
-cam.set_controls({"AfMode": 2})      # continuous autofocus on the IMX708
-time.sleep(2)
-print(f"Camera ready at {GATE_SIZE[0]}x{GATE_SIZE[1]}, "
-      f"model expects {in_w}x{in_h}. Ctrl+C to quit.\n")
+# --- camera ----------------------------------------------------------------------
+picam2 = Picamera2()
+picam2.configure(picam2.create_still_configuration(main={"size": SNAP_SIZE}))
+picam2.start()
+picam2.set_controls({"AfMode": 2})
+time.sleep(2)                                     # settle + focus
 
 
-def detect_person():
-    """Snap + run the detector. Returns (person?, best score, capture s, infer s)."""
-    t0 = time.time()
-    arr = cam.capture_array()                          # RGB numpy array
-    t_cap = time.time() - t0
+def best_person_score() -> float:
+    """Snap a frame, run the detector, return the best 'person' confidence."""
+    frame = picam2.capture_array()                # RGB numpy array
+    img = Image.fromarray(frame).convert("RGB").resize((300, 300))
+    tensor = np.expand_dims(np.asarray(img, dtype=np.uint8), axis=0)
 
-    t0 = time.time()
-    small = Image.fromarray(arr).resize((in_w, in_h))
-    tensor = np.expand_dims(np.asarray(small, dtype=np.uint8), axis=0)
-    interpreter.set_tensor(inp["index"], tensor)
+    interpreter.set_tensor(input_details[0]["index"], tensor)
     interpreter.invoke()
 
-    classes = interpreter.get_tensor(outs[1]["index"])[0]   # class ids
-    scores = interpreter.get_tensor(outs[2]["index"])[0]    # confidences
+    classes = interpreter.get_tensor(output_details[1]["index"])[0]
+    scores = interpreter.get_tensor(output_details[2]["index"])[0]
 
-    best = 0.0
-    for cls, score in zip(classes, scores):
-        if int(cls) in PERSON_IDS and score > best:
-            best = float(score)
-    t_inf = time.time() - t0
-
-    return best >= CONFIDENCE, best, t_cap, t_inf
+    person_scores = [s for c, s in zip(classes, scores) if int(c) == PERSON_ID]
+    return max(person_scores, default=0.0)
 
 
-shot = 0
-while True:
-    input("Enter to snap...")
-    shot += 1
+def person_present() -> bool:
+    """The seam the brain will use. Fail-open is the LAW: on any error, the
+    PIR already voted yes, so a broken gate must never snub a real kid."""
+    try:
+        return best_person_score() >= CONFIDENCE
+    except Exception as e:
+        print(f"   gate error ({e}) -> fail-open, treating as person")
+        return True
 
-    person, score, t_cap, t_inf = detect_person()
 
-    total = t_cap + t_inf
-    print(f"  shot {shot}: {'PERSON' if person else 'empty'}   "
-          f"(best person score: {score:.2f})")
-    print(f"  capture: {t_cap:.2f}s   infer: {t_inf:.2f}s   "
-          f"total gate: {total:.2f}s\n")
+if __name__ == "__main__":
+    print(f"Local gate up. Threshold {CONFIDENCE}. Ctrl+C to stop.\n")
+    while True:
+        t0 = time.time()
+        score = best_person_score()
+        verdict = "PERSON" if score >= CONFIDENCE else "empty"
+        print(f"gate: {time.time() - t0:.2f}s  best person score = {score:.2f}  -> {verdict}")
+        time.sleep(LOOP_PAUSE)

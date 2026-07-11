@@ -1,91 +1,105 @@
+#!/usr/bin/env python3
+"""Voice lab: audition Piper's knobs live before committing. No GPIO.
+
+Type a line -> she speaks it with the current settings.
+Type a command to turn a knob:
+    :volume 1.0      flat gain (no variation)
+    :length 1.2      speed, INVERSE — bigger is slower
+    :noise 0.667     tone wobble
+    :noisew 0.8      timing wobble
+    :show            print current settings
+    :quit
+
+Locked production settings (the brain's): volume 1.0, length_scale 1.2,
+noise_scale 0.667, noise_w_scale 0.8 — the lab starts there.
+Piper has NO pitch control; depth is a post-processing job (pedalboard, deferred).
+
+Voice files live in assets/voices/ — BOTH the .onnx and its .onnx.json
+sidecar. Piper silently needs both; the sidecar is the file selective
+copies orphan.
+
+Run from anywhere:  python3 tests/voice_test.py
+"""
 import subprocess
 import wave
+from pathlib import Path
+
 from piper import PiperVoice, SynthesisConfig
 
-VOICE  = "/home/cillam/piper-voices/en_US-kristin-medium.onnx"
-SAMPLE = ("Ahh. Come closer, mortal. The veil is thin tonight... "
-          "and I foresee a great and terrible shortage of candy in your future.")
+# --- repo anchoring (tests/ lives one level below the repo root) -------------
+ROOT = Path(__file__).resolve().parent.parent
+VOICES = ROOT / "assets" / "voices"
+VOICE_ONNX = VOICES / "en_US-kristin-medium.onnx"
 
-# current voice character — starts at Piper's defaults
-settings = {
-    "volume":        1.0,     # 0.0–1.0
-    "length_scale":  1.0,     # speed: higher = slower
-    "noise_scale":   0.667,   # expressiveness
-    "noise_w_scale": 0.8,     # rhythm variation
-}
-reverb = False                # crypt echo on the output
+WAV = Path("/tmp/voice_test.wav")
 
-print("Loading Purrserpina's voice...")
-voice = PiperVoice.load(VOICE)
-print("Ready.")
-
-def speak(text):
-    syn = SynthesisConfig(
-        volume=settings["volume"],
-        length_scale=settings["length_scale"],
-        noise_scale=settings["noise_scale"],
-        noise_w_scale=settings["noise_w_scale"],
-        normalize_audio=True,
+if not VOICE_ONNX.exists():
+    raise SystemExit(
+        f"Voice not found: {VOICE_ONNX}\n"
+        "Download en_US-kristin-medium (.onnx AND .onnx.json) from HuggingFace "
+        "rhasspy/piper-voices into assets/voices/ (see README asset manifest)."
     )
-    with wave.open("/tmp/voice_test.wav", "wb") as wav:
-        voice.synthesize_wav(text, wav, syn_config=syn)
-    cmd = ["ffplay", "-autoexit", "-nodisp", "-loglevel", "quiet"]
-    if reverb:
-        cmd += ["-af", "aecho=0.8:0.9:60:0.3"]   # vast, cold-room echo
-    cmd.append("/tmp/voice_test.wav")
-    subprocess.run(cmd)
+if not VOICE_ONNX.with_suffix(".onnx.json").exists():
+    raise SystemExit(
+        f"The .onnx is here but its sidecar is missing: {VOICE_ONNX}.json\n"
+        "Piper silently needs both — copy the .onnx.json over too."
+    )
+
+voice = PiperVoice.load(str(VOICE_ONNX))
+
+# start at the locked production settings
+knobs = {
+    "volume": 1.0,
+    "length_scale": 1.2,
+    "noise_scale": 0.667,
+    "noise_w_scale": 0.8,
+}
+
+COMMANDS = {  # command name -> knob key
+    "volume": "volume",
+    "length": "length_scale",
+    "noise": "noise_scale",
+    "noisew": "noise_w_scale",
+}
+
 
 def show():
-    print(f"  volume={settings['volume']}  length_scale={settings['length_scale']}  "
-          f"noise_scale={settings['noise_scale']}  noise_w_scale={settings['noise_w_scale']}  "
-          f"reverb={'on' if reverb else 'off'}")
+    print("   " + "  ".join(f"{k}={v}" for k, v in knobs.items()))
 
-HELP = """
-Commands:
-  (press Enter)       speak the sample line with current settings
-  <any text>          speak your own line
-  vol N               volume        (0.0-1.0)
-  len N               length_scale  (speed; higher = slower)
-  noise N             noise_scale   (expressiveness)
-  noisew N            noise_w_scale (rhythm)
-  reverb on | off     toggle crypt echo
-  show                print current settings
-  reset               back to Piper defaults
-  q                   quit
-"""
-print(HELP)
+
+def speak(text: str):
+    cfg = SynthesisConfig(**knobs)
+    with wave.open(str(WAV), "wb") as f:
+        voice.synthesize_wav(text, f, syn_config=cfg)
+    subprocess.run(["ffplay", "-autoexit", "-nodisp", "-loglevel", "quiet", str(WAV)])
+
+
+print("Voice lab — kristin. Type a line to hear it, :show for settings, :quit to leave.")
 show()
-
-ALIASES = {"vol": "volume", "len": "length_scale",
-           "noise": "noise_scale", "noisew": "noise_w_scale"}
 
 while True:
     try:
-        line = input("\nvoice> ").strip()
+        line = input("\n> ").strip()
     except (EOFError, KeyboardInterrupt):
         break
-
-    if line in ("q", "quit", "exit"):
-        break
-    elif line == "":
-        speak(SAMPLE)
-    elif line == "show":
-        show()
-    elif line == "reset":
-        settings.update(volume=1.0, length_scale=1.0,
-                        noise_scale=0.667, noise_w_scale=0.8)
-        reverb = False
-        show()
-    elif line.startswith("reverb"):
-        parts = line.split()
-        reverb = len(parts) > 1 and parts[1].lower() in ("on", "true", "1", "yes")
-        show()
-    elif line.split()[0] in ALIASES:
-        parts = line.split()
-        try:
-            settings[ALIASES[parts[0]]] = float(parts[1])
+    if not line:
+        continue
+    if line.startswith(":"):
+        parts = line[1:].split()
+        cmd = parts[0].lower()
+        if cmd in ("quit", "q", "exit"):
+            break
+        if cmd == "show":
             show()
-        except (IndexError, ValueError):
-            print("  ?  usage: <param> <number>   e.g.  len 1.3")
-    else:
-        speak(line)
+        elif cmd in COMMANDS and len(parts) == 2:
+            try:
+                knobs[COMMANDS[cmd]] = float(parts[1])
+                show()
+            except ValueError:
+                print("   need a number, e.g. :length 1.3")
+        else:
+            print("   commands: :volume :length :noise :noisew :show :quit")
+        continue
+    speak(line)
+
+print("Done.")
