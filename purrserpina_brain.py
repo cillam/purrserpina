@@ -82,7 +82,7 @@ JAW_MODE   = "amplitude"   # "amplitude" = track loudness; "flap" = old fixed ch
 JAW_FRAME  = 0.1          # seconds per jaw update (~17 Hz — servo can track, syllables show)
 JAW_SMOOTH = 0.8           # 0-1 glide toward each target (lower = smoother/lazier jaw)
 JAW_FLOOR  = 0.06          # normalized RMS at/below this reads as silence -> mouth shut
-JAW_GAMMA  = 0.6           # <1 opens the mouth more readily on quieter speech
+JAW_GAMMA  = 0.4           # <1 opens the mouth more readily on quieter speech
 
 SPOKE_THRESHOLD = 0.03   # min sustained loudness for a recording to count as speech
 
