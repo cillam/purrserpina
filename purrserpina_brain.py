@@ -308,9 +308,6 @@ def jaw_envelope(path):
     ref = np.percentile(speech, 90)                  # loud-speech level, ignores lone transients
     denom = max(ref - JAW_FLOOR, 1e-3)
     env = np.clip((rms - JAW_FLOOR) / denom, 0.0, 1.0) ** JAW_GAMMA
-    if len(env) >= 3:                                # light de-jitter
-        env = np.convolve(env, np.ones(3) / 3, mode="same")
-    positions = MOUTH_SHUT + env * (MOUTH_OPEN - MOUTH_SHUT)
     return JAW_FRAME, positions.tolist()
 
 
