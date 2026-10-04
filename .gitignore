@@ -2,3 +2,7 @@ my_pi/
 .DS_Store
 assets/
 docs/buildlogs/
+docs/posts/
+docs/index.md
+docs/_config.yml
+learning_resources.pages

@@ -76,6 +76,14 @@ NEXT_START_WAIT   = 6       # later questions: a touch shorter than the first, b
 
 MOUTH_OPEN, MOUTH_SHUT, FLAP = 0.3, -0.2, 0.13
 
+# Amplitude-driven jaw: mouth tracks the loudness of the wav, so it falls still
+# during her pauses and "..." beats instead of chattering straight through them.
+JAW_MODE   = "amplitude"   # "amplitude" = track loudness; "flap" = old fixed chatter (A/B)
+JAW_FRAME  = 0.06          # seconds per jaw update (~17 Hz — servo can track, syllables show)
+JAW_SMOOTH = 0.5           # 0-1 glide toward each target (lower = smoother/lazier jaw)
+JAW_FLOOR  = 0.06          # normalized RMS at/below this reads as silence -> mouth shut
+JAW_GAMMA  = 0.6           # <1 opens the mouth more readily on quieter speech
+
 SPOKE_THRESHOLD = 0.03   # min sustained loudness for a recording to count as speech
 
 def peak_level(audio):
@@ -276,16 +284,64 @@ def synth(text, path, announce=True):
         print(f"   synthesize: {perf_counter() - t0:.1f}s")
 
 
-def play(path, final=True):
-    """Play a wav while flapping the jaw to it (skips gracefully if it's missing).
-    `final=False` leaves the jaw engaged, for streaming consecutive sentences."""
-    if not path or not os.path.exists(path):
-        return
+def jaw_envelope(path):
+    """Read a wav and return (frame_sec, [jaw positions]) tracking its loudness.
+    Each frame's RMS is normalized to the clip's own peak, then mapped onto
+    MOUTH_SHUT..MOUTH_OPEN — so a quiet line still moves the mouth, and the
+    gaps between words land at MOUTH_SHUT."""
+    with wave.open(path, "rb") as w:
+        rate = w.getframerate(); n = w.getnframes(); ch = w.getnchannels()
+        raw = w.readframes(n)
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    if ch > 1:
+        samples = samples.reshape(-1, ch).mean(axis=1)
+    if samples.size == 0:
+        return JAW_FRAME, []
+    samples /= 32768.0
+    step = max(1, int(JAW_FRAME * rate))
+    rms = np.array([np.sqrt(np.mean(samples[i:i + step] ** 2)) if samples[i:i + step].size
+                    else 0.0 for i in range(0, len(samples), step)])
+    peak = rms.max()
+    if peak < 1e-6:                                  # dead-silent clip
+        return JAW_FRAME, [MOUTH_SHUT] * len(rms)
+    denom = max(peak - JAW_FLOOR, 1e-3)
+    env = np.clip((rms - JAW_FLOOR) / denom, 0.0, 1.0) ** JAW_GAMMA
+    positions = MOUTH_SHUT + env * (MOUTH_OPEN - MOUTH_SHUT)
+    return JAW_FRAME, positions.tolist()
+
+
+def _play_flap(path, final):
+    """The original fixed-timer flap — kept for A/B against the amplitude jaw."""
     player = subprocess.Popen(["ffplay", "-autoexit", "-nodisp",
                                "-loglevel", "quiet", path])
     while player.poll() is None:
         jaw.value = MOUTH_OPEN; sleep(FLAP)
         jaw.value = MOUTH_SHUT; sleep(FLAP)
+    if final:
+        jaw.value = MOUTH_SHUT; sleep(0.3); jaw.detach()
+
+
+def play(path, final=True):
+    """Play a wav while moving the jaw to it (skips gracefully if it's missing).
+    `final=False` leaves the jaw engaged, for streaming consecutive sentences.
+    The jaw is driven by the wav's own loudness envelope, kept in sync by
+    wall-clock position (not loop count), so it never drifts from the audio."""
+    if not path or not os.path.exists(path):
+        return
+    if JAW_MODE != "amplitude":
+        return _play_flap(path, final)
+
+    frame_sec, positions = jaw_envelope(path)
+    player = subprocess.Popen(["ffplay", "-autoexit", "-nodisp",
+                               "-loglevel", "quiet", path])
+    pos = MOUTH_SHUT
+    t0 = perf_counter()
+    while player.poll() is None:
+        idx = int((perf_counter() - t0) / frame_sec)       # where we are in the clip
+        target = positions[idx] if idx < len(positions) else MOUTH_SHUT
+        pos += (target - pos) * JAW_SMOOTH                  # glide, don't snap
+        jaw.value = pos
+        sleep(frame_sec)
     if final:
         jaw.value = MOUTH_SHUT; sleep(0.3); jaw.detach()
 
