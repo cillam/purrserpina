@@ -79,7 +79,7 @@ MOUTH_OPEN, MOUTH_SHUT, FLAP = 0.4, -0.2, 0.13
 # Amplitude-driven jaw: mouth tracks the loudness of the wav, so it falls still
 # during her pauses and "..." beats instead of chattering straight through them.
 JAW_MODE   = "amplitude"   # "amplitude" = track loudness; "flap" = old fixed chatter (A/B)
-JAW_FRAME  = 0.06          # seconds per jaw update (~17 Hz — servo can track, syllables show)
+JAW_FRAME  = 0.1          # seconds per jaw update (~17 Hz — servo can track, syllables show)
 JAW_SMOOTH = 0.8           # 0-1 glide toward each target (lower = smoother/lazier jaw)
 JAW_FLOOR  = 0.06          # normalized RMS at/below this reads as silence -> mouth shut
 JAW_GAMMA  = 0.6           # <1 opens the mouth more readily on quieter speech
