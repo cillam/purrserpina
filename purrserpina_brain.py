@@ -286,9 +286,10 @@ def synth(text, path, announce=True):
 
 def jaw_envelope(path):
     """Read a wav and return (frame_sec, [jaw positions]) tracking its loudness.
-    Each frame's RMS is normalized to the clip's own peak, then mapped onto
-    MOUTH_SHUT..MOUTH_OPEN — so a quiet line still moves the mouth, and the
-    gaps between words land at MOUTH_SHUT."""
+    Normalizes to the 90th-percentile SPEECH level — not the single loudest
+    sample — so one plosive can't set the ceiling and squash all the ordinary
+    speech into a low-amplitude shake. A light 3-frame moving-average smooths
+    out residual jitter so the jaw glides between syllables instead of buzzing."""
     with wave.open(path, "rb") as w:
         rate = w.getframerate(); n = w.getnframes(); ch = w.getnchannels()
         raw = w.readframes(n)
@@ -301,11 +302,14 @@ def jaw_envelope(path):
     step = max(1, int(JAW_FRAME * rate))
     rms = np.array([np.sqrt(np.mean(samples[i:i + step] ** 2)) if samples[i:i + step].size
                     else 0.0 for i in range(0, len(samples), step)])
-    peak = rms.max()
-    if peak < 1e-6:                                  # dead-silent clip
+    speech = rms[rms > JAW_FLOOR]
+    if speech.size == 0:                             # dead-silent clip -> mouth shut
         return JAW_FRAME, [MOUTH_SHUT] * len(rms)
-    denom = max(peak - JAW_FLOOR, 1e-3)
+    ref = np.percentile(speech, 90)                  # loud-speech level, ignores lone transients
+    denom = max(ref - JAW_FLOOR, 1e-3)
     env = np.clip((rms - JAW_FLOOR) / denom, 0.0, 1.0) ** JAW_GAMMA
+    if len(env) >= 3:                                # light de-jitter
+        env = np.convolve(env, np.ones(3) / 3, mode="same")
     positions = MOUTH_SHUT + env * (MOUTH_OPEN - MOUTH_SHUT)
     return JAW_FRAME, positions.tolist()
 
