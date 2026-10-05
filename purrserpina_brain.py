@@ -160,6 +160,13 @@ MAX_CONVO_SECONDS = 240     # backstop only (a full 3-question audience can run 
 COOLDOWN          = 3       # seconds of no-motion settle before re-arming
 REPLY_TOKENS      = 200     # a fortune is 1-3 sentences; keeps her terse and fast
 
+# "Ask, don't look": if the visitor's FIRST words are small talk rather than a
+# question, she asks what creature they've come as (no camera — she takes their
+# word). She flags that by starting her reply with this tag; CODE strips it,
+# refunds the question, and makes their answer a free turn. At most once per
+# visitor, first utterance only, so a confused model can't stretch an audience.
+COSTUME_TAG       = "[COSTUME]"
+
 # Spoken on waking — canned (instant). The opener depends on WHAT woke her;
 # the terms (her three-question law) are shared, so the rule lives in one place.
 OPENERS = {
@@ -531,24 +538,44 @@ def transcribe(audio16):
     return text
 
 
-def ask_purrserpina(history, child_text, questions_used):
+def ask_purrserpina(history, child_text, questions_used, turn_kind="normal"):
     """Send the running conversation to Claude and get her next line.
+    Returns (reply, costume_asked).
 
     The cap is enforced HERE: on the final question we append a stage direction
     telling her to dismiss the guest. The model never owns the count — only the
     flavour of the goodbye. `history` is mutated in place so she remembers the
     whole audience.
+
+    turn_kind:
+      "first"          — the visitor's first words; if they're small talk, she may
+                         ask about their costume and flag it with COSTUME_TAG
+      "costume_answer" — their reply to her costume question; a FREE turn
+      "normal"         — an ordinary counted question
     """
     history.append({"role": "user", "content": child_text})
 
     remaining = MAX_QUESTIONS - questions_used   # questions left AFTER this one
-    if remaining <= 0:
+    if turn_kind == "costume_answer":
+        pacing = (f"\n\nSTAGE DIRECTION: You just asked the visitor what creature they have "
+                  f"come as. This is their answer, and it does NOT spend one of their questions. "
+                  f"React to the costume they describe, then bid them put their first true "
+                  f"question to you. They still have all {remaining} questions. "
+                  f"(If instead they asked you a question, simply answer it.)")
+    elif remaining <= 0:
         pacing = ("\n\nSTAGE DIRECTION: This is the visitor's final question — they have no "
                   "more after this. Answer it, then dismiss them with grand finality and send "
                   "them on their way into the night.")
     else:
         pacing = (f"\n\nSTAGE DIRECTION: The visitor has {remaining} question(s) remaining "
                   "after this one. Do not dismiss them yet.")
+    if turn_kind == "first":
+        pacing += (f"\n\nSTAGE DIRECTION: If the visitor's words are NOT a question for the "
+                   f"oracle — only a greeting, 'trick or treat', or small talk — do not treat "
+                   f"them as a question and do not mention how many questions remain. Instead "
+                   f"reply briefly and ask, in character, what manner of creature they have "
+                   f"come as tonight. In that case ONLY, begin your reply with the exact token "
+                   f"{COSTUME_TAG}. If they asked a real question, answer it and omit the token.")
 
     t0 = perf_counter()
     try:
@@ -564,11 +591,16 @@ def ask_purrserpina(history, child_text, questions_used):
         reply = ERROR_LINE
     print(f"   think: {perf_counter() - t0:.1f}s")
 
+    # The tag is ALWAYS stripped (she must never say "bracket costume" aloud),
+    # but only honoured on the first turn — code owns where it's allowed.
+    costume_asked = COSTUME_TAG in reply and turn_kind == "first"
+    reply = reply.replace(COSTUME_TAG, "")
+
     reply = clean_for_speech(reply)             # strip any *asterisks* / markdown before she speaks
     if not reply:
-        reply = ERROR_LINE
+        reply, costume_asked = ERROR_LINE, False
     history.append({"role": "assistant", "content": reply})
-    return reply
+    return reply, costume_asked
 
 
 def synth(text, path, announce=True):
@@ -713,9 +745,13 @@ def channel():
 
 def hold_audience(wake_reason):
     """One full visitor: greet, grant up to MAX_QUESTIONS, dismiss. Fresh memory each time.
-    Returns how many questions were asked (0 = nobody answered the greeting)."""
+    Returns how many times the visitor spoke (0 = nobody answered the greeting).
+    turns counts every utterance; questions_used counts only the ones that spend
+    one of her three — small talk + the costume answer are free (once, see COSTUME_TAG)."""
     history = []                 # wiped per visitor — never bleed one kid into the next
     questions_used = 0
+    turns = 0
+    costume_pending = False      # she just asked what they've come as; next turn is free
     convo_start = perf_counter()
 
     eyes.color = WAKE_COLOR                     # purple — she stirs
@@ -731,7 +767,7 @@ def hold_audience(wake_reason):
         eyes.pulse(on_color=LISTEN_COLOR, off_color=(0, 0, 0),
                    fade_in_time=0.6, fade_out_time=0.6)
         # first question after the greeting gets a more patient begin-wait
-        start_wait = FIRST_START_WAIT if questions_used == 0 else NEXT_START_WAIT
+        start_wait = FIRST_START_WAIT if turns == 0 else NEXT_START_WAIT
         print(f"   Your turn ({MAX_QUESTIONS - questions_used} left)... speak.")
         audio16 = record(start_wait)
 
@@ -741,21 +777,31 @@ def hold_audience(wake_reason):
             print("   (silence)")
             break
 
-        questions_used += 1
+        if turns == 0:
+            kind = "first"                      # may turn out to be small talk (refunded below)
+        elif costume_pending:
+            kind = "costume_answer"             # free turn — doesn't spend a question
+        else:
+            kind = "normal"
+        costume_pending = False
+        turns += 1
+        if kind != "costume_answer":
+            questions_used += 1
         eyes.off()                              # kill the pulse thread...
         eyes.color = THINK_COLOR                # ...red holds, INSTANTLY after they stop
 
         # Backend thread: transcribe -> Claude -> synth, sentence by sentence.
         segq = Queue()
-        def brain_then_synth(audio=audio16, qnum=questions_used):
+        result = {"costume": False}             # worker -> main thread, read after join()
+        def brain_then_synth(audio=audio16, qnum=questions_used, kind=kind):
             try:
                 try:
                     heard = transcribe(audio)
                     if not heard:
                         heard = "(the visitor's words were too muddled to make out — " \
                                 "ask them, in character, to speak up and repeat)"
-                    print(f"   Q{qnum}: {heard!r}")
-                    reply = ask_purrserpina(history, heard, qnum)
+                    print(f"   {'costume' if kind == 'costume_answer' else f'Q{qnum}'}: {heard!r}")
+                    reply, result["costume"] = ask_purrserpina(history, heard, qnum, kind)
                 except Exception as e:
                     print(f"   (brain error: {e})")
                     reply = ERROR_LINE
@@ -791,8 +837,13 @@ def hold_audience(wake_reason):
         jaw.value = MOUTH_SHUT; sleep(0.3); jaw.detach()
         worker.join()
 
+        if result["costume"]:                   # it was small talk, not a question
+            questions_used -= 1                 # refund it...
+            costume_pending = True              # ...and their costume answer is free
+            print("   (small talk — she asked about the costume; question refunded)")
+
     # How did the audience end?
-    if questions_used == 0:
+    if turns == 0:
         if wake_reason == "persist":            # probably the wind — let her say so
             eyes.color = SPEAK_COLOR
             play(WIND_WAV)
@@ -801,7 +852,7 @@ def hold_audience(wake_reason):
         eyes.color = SPEAK_COLOR
         play(DISMISS_WAV)
     # else: her final answer already dismissed them — nothing to add.
-    return questions_used
+    return turns
 
 
 # ----------------------------------------------------------------------
