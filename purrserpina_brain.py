@@ -470,8 +470,20 @@ def record(start_wait):
                         silent_run = 0
                     else:
                         silent_run += 1
-                        if silent_run >= hang_blocks:   # you've finished
-                            break
+                        if silent_run >= hang_blocks:   # you've finished... or never really started
+                            if peak_level(_to_16k(frames)) >= SPOKE_THRESHOLD:
+                                break                   # real speech — done
+                            # FALSE START: a blip (speaker tail, creak, breath) crossed the
+                            # start threshold but the clip isn't speech. Don't spend the
+                            # guest's turn on it — discard and keep waiting with whatever
+                            # is left of the begin-wait. (Its blocks count against that budget.)
+                            waited += len(frames)
+                            print(f"   (false start, {len(frames) * BLOCK_SEC:.1f}s too quiet "
+                                  f"— still listening)")
+                            frames, speaking, silent_run = [], False, 0
+                            if waited >= start_blocks:
+                                break
+                            continue
                     if len(frames) >= speak_blocks:     # safety cap on a single answer
                         break
                 else:
@@ -493,9 +505,16 @@ def record(start_wait):
               f"threshold {SILENCE_THRESHOLD})")
         return None
 
+    print(f"   (recorded {len(frames) * BLOCK_SEC:.1f}s, peak {peak:.3f})")
+    return _to_16k(frames)
+
+
+def _to_16k(frames):
+    """48 kHz blocks -> one 16 kHz mono clip (clean 3:1 average). Shared by
+    record()'s false-start check and its return, so both judge the SAME audio
+    that hold_audience's SPOKE_THRESHOLD check will see."""
     audio = np.concatenate(frames).flatten()
-    print(f"   (recorded {len(audio) / MIC_RATE:.1f}s, peak {peak:.3f})")
-    trim = len(audio) - (len(audio) % 3)            # 48k -> 16k, clean 3:1
+    trim = len(audio) - (len(audio) % 3)
     return audio[:trim].reshape(-1, 3).mean(axis=1).astype(np.float32)
 
 
