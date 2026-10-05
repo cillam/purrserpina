@@ -2,24 +2,30 @@
 """
 Purrserpina — the BRAIN, on the listening-cues body.
 
-Motion wakes her; she greets the guest and names her terms (three questions);
-she listens (eyes pulsing green), thinks (red), and answers in character in her
-own Piper voice (blue-white), jaw moving in time — remembering the conversation
-as it goes. After three questions she dismisses the guest and sleeps, then
-re-arms for the next mortal with a blank memory.
+Three things can wake her (see wait_for_wake):
+  - gate     — PIR fires AND the local camera gate sees a person
+  - persist  — gate says no, but motion is SUSTAINED (the T-rex-suit fallback)
+  - button   — the summon bell; a press IS a person, so no gate check
+The button is ignored while she's awake or cooling down. Fail-open is the law:
+any gate error or missing camera/model means she greets anyway.
+
+Once awake she greets the guest (opener chosen by wake_reason) and names her
+terms (three questions); she listens (eyes pulsing green), thinks (red), and
+answers in character in her own Piper voice (blue-white), jaw moving in time —
+remembering the conversation as it goes. After three questions she dismisses the
+guest and sleeps, then re-arms for the next mortal with a blank memory.
 
 The three-question cap is enforced in CODE, not by the model: on the final
 question we tell her (via a stage direction) to dismiss the guest. She owns the
 flavour of the goodbye; the code owns the fact of it.
 
-Still prints transcribe/synthesize times — kept for the latency pass coming next
-(stall line + sentence streaming), which is deliberately NOT in here yet.
-
-Needs:  pip install --break-system-packages anthropic
+Needs:  pip install --break-system-packages anthropic ai-edge-litert
+        python3-picamera2 + python3-pil (apt — NOT pip, for picamera2)
         ANTHROPIC_API_KEY in the environment (already set).
         prompts/system_prompt.md   — her character (edit that file to tune her)
-        assets/voices|sounds/      — kristin .onnx(.json), consulting.wav,
-                                     miracle.mp3 (gitignored; see README)
+        assets/voices|sounds|models/ — kristin .onnx(.json), consulting.wav,
+                                     miracle.mp3, detect.tflite + labelmap.txt
+                                     (gitignored; see README)
 
 Run:  python3 purrserpina_brain.py     (Ctrl+C to stop)
 """
@@ -33,12 +39,30 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 from queue import Queue
-from threading import Thread, Event
-from time import sleep, perf_counter
-from gpiozero import MotionSensor, RGBLED, Servo
+from threading import Thread, Event, Lock
+from time import sleep, perf_counter, monotonic
+from gpiozero import MotionSensor, RGBLED, Servo, Button
 from faster_whisper import WhisperModel
 from piper import PiperVoice, SynthesisConfig
 from anthropic import Anthropic
+
+# Camera + local person-detector. Imported defensively: if either is missing,
+# the gate disables itself and she falls back to waking on PIR alone (fail-open).
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    Picamera2 = None
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+try:                                    # tflite-runtime is dead; LiteRT is the successor
+    from ai_edge_litert.interpreter import Interpreter
+except ImportError:
+    try:
+        from tflite_runtime.interpreter import Interpreter
+    except ImportError:
+        Interpreter = None
 
 # ----------------------------------------------------------------------
 # Project layout — every path is anchored to the repo, wherever it's cloned.
@@ -51,10 +75,33 @@ PROMPTS = ROOT / "prompts"
 # ----------------------------------------------------------------------
 # Hardware
 # ----------------------------------------------------------------------
-pir  = MotionSensor(23)
-eyes = RGBLED(red=17, green=27, blue=22)
-jaw  = Servo(18)
+pir    = MotionSensor(23)
+eyes   = RGBLED(red=17, green=27, blue=22)
+jaw    = Servo(18)
 jaw.detach()
+button = Button(24, bounce_time=0.1)    # summon bell (pins 18 + 20); a ring is a mechanical shock
+
+# ----------------------------------------------------------------------
+# Wake arbitration — three sources, one guard (ported from tests/wake_test.py)
+# ----------------------------------------------------------------------
+GATE_MODE         = "local"  # "local" = real camera gate | "off" = PIR alone (always yes)
+                             # "stub_yes" / "stub_no" = force the gate's answer (protocol testing;
+                             # stub_no is how you exercise the persistence path)
+CONFIDENCE        = 0.50     # person score >= this counts as "someone there" — the tuning dial
+GATE_MIN_INTERVAL = 3.0      # seconds between gate checks while motion persists (windy nights)
+SNAP_SIZE         = (1280, 720)  # what the gate scores were tuned at; also the costume-photo size
+
+PERSIST_WINDOW    = 12.0     # look-back window (s)
+PERSIST_DWELL     = 5.0      # cumulative PIR-high seconds required inside the window
+PERSIST_EVENTS    = 3        # distinct motion events required inside the window
+PERSIST_BACKOFF_START = 60.0   # first unanswered persistence wake rests that path this long (s)
+PERSIST_BACKOFF_MAX   = 240.0  # each CONSECUTIVE unanswered one doubles it, up to this cap:
+                               # 60 -> 120 -> 240 -> 240... Anyone answering her resets it.
+# Keep the HC-SR501 hold-time dial near MINIMUM or it inflates dwell.
+
+MODELS     = ASSETS / "models"
+MODEL_FILE = MODELS / "detect.tflite"
+LABEL_FILE = MODELS / "labelmap.txt"
 
 # eye-state colors (R, G, B), 0.0-1.0
 WAKE_COLOR     = (0.4, 0.0, 0.5)        # purple     — stirring / greeting
@@ -79,7 +126,7 @@ MOUTH_OPEN, MOUTH_SHUT, FLAP = 0.4, -0.2, 0.13
 # Amplitude-driven jaw: mouth tracks the loudness of the wav, so it falls still
 # during her pauses and "..." beats instead of chattering straight through them.
 JAW_MODE   = "amplitude"   # "amplitude" = track loudness; "flap" = old fixed chatter (A/B)
-JAW_FRAME  = 0.1          # seconds per jaw update (~17 Hz — servo can track, syllables show)
+JAW_FRAME  = 0.1          # seconds per jaw update (10 Hz — servo can track, syllables show)
 JAW_SMOOTH = 0.8           # 0-1 glide toward each target (lower = smoother/lazier jaw)
 JAW_FLOOR  = 0.06          # normalized RMS at/below this reads as silence -> mouth shut
 JAW_GAMMA  = 0.4           # <1 opens the mouth more readily on quieter speech
@@ -107,15 +154,25 @@ syn = SynthesisConfig(
 # Conversation rules
 # ----------------------------------------------------------------------
 MODEL             = "claude-haiku-4-5"   # fast + cheap; pin to a dated string if you like
-MAX_QUESTIONS     = 3       # her ancient law. If you change this, edit GREETING's "three" too.
+MAX_QUESTIONS     = 3       # her ancient law. If you change this, edit TERMS's "three" too.
 MAX_CONVO_SECONDS = 240     # backstop only (a full 3-question audience can run ~2 min);
                             # the 3-question + per-turn caps already bound a normal audience
 COOLDOWN          = 3       # seconds of no-motion settle before re-arming
 REPLY_TOKENS      = 200     # a fortune is 1-3 sentences; keeps her terse and fast
 
-# Spoken on waking — canned (instant) and states her terms as lore.
-GREETING = ("Ah. A visitor. I am purr sir pin ah, and the dead do not chatter idly. "
-            "You may put three questions to me, mortal. Choose them with care. Speak.")
+# Spoken on waking — canned (instant). The opener depends on WHAT woke her;
+# the terms (her three-question law) are shared, so the rule lives in one place.
+OPENERS = {
+    "gate":    "Ah. A visitor.",
+    "persist": "I sense... something. Show yourself.",
+    "button":  "You rang?... How refreshingly presumptuous.",
+}
+TERMS = ("I am purr sir pin ah, and the dead do not chatter idly. "
+         "You may put three questions to me, mortal. Choose them with care. Speak.")
+
+# Spoken when a persistence wake gets no reply — so the windy-night false
+# alarm reads as her character, not a glitch.
+WIND_LINE = "Hm. Only the wind, then."
 
 # Spoken if a guest drifts off before spending all three questions.
 EARLY_DISMISSAL = "Hm. Gone already. The living are so fleeting. Begone, then."
@@ -161,6 +218,221 @@ print("Loading Purrserpina's ears, voice, and mind...")
 model  = WhisperModel("tiny.en", device="cpu", compute_type="int8", cpu_threads=4)
 voice  = PiperVoice.load(str(VOICE))
 claude = Anthropic()   # reads ANTHROPIC_API_KEY from the environment
+
+
+# ----------------------------------------------------------------------
+# The camera — ONE Picamera2 for the whole program (it can't be opened twice).
+# The wake gate uses it now; the costume photo will use this same instance.
+# Started once and left running so continuous autofocus stays settled and a
+# snap is near-instant. If it fails to come up, picam2 stays None and the gate
+# fails open (she wakes on PIR alone, exactly as before this merge).
+# ----------------------------------------------------------------------
+picam2   = None
+cam_lock = Lock()              # one capture at a time, whichever thread asks
+if Picamera2 is not None:
+    try:
+        picam2 = Picamera2()
+        # "BGR888" is picamera2's name for a numpy array in [R, G, B] order —
+        # the naming is backwards, the pixels are RGB. Don't "fix" it.
+        picam2.configure(picam2.create_still_configuration(
+            main={"size": SNAP_SIZE, "format": "BGR888"}))
+        picam2.start()
+        picam2.set_controls({"AfMode": 2})       # continuous autofocus
+        sleep(2)                                 # settle + first focus
+        print("   camera up.")
+    except Exception as e:
+        print(f"   (CAMERA UNAVAILABLE: {e}) — gate fails open, PIR alone wakes her")
+        picam2 = None
+else:
+    print("   (picamera2 not installed) — gate fails open, PIR alone wakes her")
+
+
+def capture_frame():
+    """One RGB numpy frame from the shared camera. Raises if there's no camera."""
+    if picam2 is None:
+        raise RuntimeError("no camera")
+    with cam_lock:
+        return picam2.capture_array()
+
+
+# ----------------------------------------------------------------------
+# The local person-gate (ported from tests/gate_test_local.py)
+# ----------------------------------------------------------------------
+detector = None
+if GATE_MODE == "local":
+    try:
+        if Interpreter is None or Image is None:
+            raise RuntimeError("ai-edge-litert or PIL not installed")
+        labels = [l.strip() for l in LABEL_FILE.read_text().splitlines()]
+        PERSON_ID = labels.index("person")       # some labelmaps start with '???'
+        detector = Interpreter(model_path=str(MODEL_FILE), num_threads=4)
+        detector.allocate_tensors()
+        DET_IN  = detector.get_input_details()
+        DET_OUT = detector.get_output_details()
+        print("   person-gate up.")
+    except Exception as e:
+        print(f"   (PERSON-GATE UNAVAILABLE: {e}) — gate fails open, PIR alone wakes her")
+        detector = None
+
+
+def best_person_score() -> float:
+    """Snap a frame, run the detector, return the best 'person' confidence."""
+    frame = capture_frame()
+    img = Image.fromarray(frame).convert("RGB").resize((300, 300))
+    tensor = np.expand_dims(np.asarray(img, dtype=np.uint8), axis=0)
+    detector.set_tensor(DET_IN[0]["index"], tensor)
+    detector.invoke()
+    classes = detector.get_tensor(DET_OUT[1]["index"])[0]
+    scores  = detector.get_tensor(DET_OUT[2]["index"])[0]
+    person_scores = [s for c, s in zip(classes, scores) if int(c) == PERSON_ID]
+    return float(max(person_scores, default=0.0))
+
+
+def person_present() -> bool:
+    """Is someone actually there? FAIL-OPEN is the law: the PIR already voted
+    yes, so any error, missing camera, or missing model means greet anyway.
+    Greeting an empty porch is atmosphere; snubbing a real kid is a broken prop."""
+    if GATE_MODE == "stub_yes":
+        return True
+    if GATE_MODE == "stub_no":
+        return False
+    if GATE_MODE != "local" or detector is None or picam2 is None:
+        return True                              # gate off/unavailable -> PIR alone
+    try:
+        t0 = perf_counter()
+        score = best_person_score()
+        seen = score >= CONFIDENCE
+        print(f"   gate: {perf_counter() - t0:.2f}s  person score {score:.2f} "
+              f"-> {'PERSON' if seen else 'empty'}")
+        return seen
+    except Exception as e:
+        print(f"   (gate error: {e}) -> fail-open, treating as person")
+        return True
+
+
+# ----------------------------------------------------------------------
+# Wake state — shared between the main loop and gpiozero's callback thread.
+# ----------------------------------------------------------------------
+state_lock            = Lock()
+awake                 = False   # covers wake decision through the END of re-arm (incl. cooldown)
+button_requested      = False   # set by the button callback, consumed by wait_for_wake
+motion_events         = []      # PIR-high intervals: [start, end_or_None]
+last_gate_check       = 0.0
+persist_backoff_until = 0.0
+wind_streak           = 0       # consecutive persistence wakes nobody answered
+
+
+def after_audience(wake_reason, answered):
+    """Escalating persistence backoff. A real guest (any source) resets it; an
+    unanswered persistence wake was probably the wind, so rest that path —
+    briefly the first time, doubling each time in a row, capped. One fluke
+    costs ~a minute of blind spot; a gusty night still quiets her down.
+    Returns the backoff applied in seconds (0 if none), for the console."""
+    global wind_streak, persist_backoff_until
+    if answered > 0:
+        wind_streak = 0                    # a real visitor — the wind theory is dead
+        return 0.0
+    if wake_reason != "persist":
+        return 0.0                         # silent gate/button wakes don't count either way
+    backoff = min(PERSIST_BACKOFF_START * 2 ** wind_streak, PERSIST_BACKOFF_MAX)
+    wind_streak += 1
+    persist_backoff_until = monotonic() + backoff
+    return backoff
+
+
+def on_motion():
+    with state_lock:
+        motion_events.append([monotonic(), None])
+
+
+def on_no_motion():
+    with state_lock:
+        if motion_events and motion_events[-1][1] is None:
+            motion_events[-1][1] = monotonic()
+
+
+def on_button():
+    """Runs on gpiozero's thread — keep it tiny. A press only counts while asleep."""
+    global button_requested
+    with state_lock:
+        if awake:
+            print("   button IGNORED (awake / cooling down)")
+        else:
+            button_requested = True
+
+
+def consume_button() -> bool:
+    """True (once) if the bell was rung while she slept."""
+    global button_requested
+    with state_lock:
+        pressed, button_requested = button_requested, False
+    return pressed
+
+
+def persistence_met() -> bool:
+    """Dwell, not triggers: cumulative PIR-high seconds AND distinct events inside
+    the look-back window. Deliberately hard to trip — leaves flap in the wind."""
+    now = monotonic()
+    window_start = now - PERSIST_WINDOW
+    dwell, events = 0.0, 0
+    with state_lock:
+        for start, end in motion_events:
+            e = end if end is not None else now          # still-open interval
+            s = max(start, window_start)
+            if e > s:
+                dwell += e - s
+                events += 1
+    return dwell >= PERSIST_DWELL and events >= PERSIST_EVENTS
+
+
+def prune_events():
+    """Drop intervals that ended before the look-back window (keep the list tiny)."""
+    cutoff = monotonic() - PERSIST_WINDOW
+    with state_lock:
+        motion_events[:] = [ev for ev in motion_events if ev[1] is None or ev[1] > cutoff]
+
+
+def wait_for_wake() -> str:
+    """Block until something wakes her; return the wake_reason.
+    Priority while asleep: button > gate > persistence."""
+    global last_gate_check
+    while True:
+        # 1) button — a press IS a person
+        if consume_button():
+            return "button"
+
+        # 2) PIR-driven paths
+        if pir.motion_detected:
+            now = monotonic()
+            if now - last_gate_check >= GATE_MIN_INTERVAL:
+                last_gate_check = now
+                seen = person_present()
+                # the bell may have rung DURING the gate check — it wins
+                if consume_button():
+                    return "button"
+                if seen:
+                    return "gate"
+
+            # gate said no (or is rate-limited): consider persistence
+            if monotonic() >= persist_backoff_until and persistence_met():
+                return "persist"
+
+        prune_events()
+        sleep(0.1)
+
+
+def rearm():
+    """Wait for the porch to clear, settle, then accept the next mortal. The button
+    stays ignored until the very end of this, and any stray press is discarded."""
+    global awake, button_requested
+    pir.wait_for_no_motion()
+    sleep(COOLDOWN)
+    with state_lock:
+        awake = False
+        button_requested = False
+        # forget finished motion, but keep an interval that's still OPEN —
+        # otherwise someone already moving would be invisible to persistence
+        motion_events[:] = [ev for ev in motion_events if ev[1] is None]
 
 
 def record(start_wait):
@@ -288,8 +560,8 @@ def jaw_envelope(path):
     """Read a wav and return (frame_sec, [jaw positions]) tracking its loudness.
     Normalizes to the 90th-percentile SPEECH level — not the single loudest
     sample — so one plosive can't set the ceiling and squash all the ordinary
-    speech into a low-amplitude shake. A light 3-frame moving-average smooths
-    out residual jitter so the jaw glides between syllables instead of buzzing."""
+    speech into a low-amplitude shake. (No moving-average: it ate the short
+    bursts canned lines are made of — see log 07. JAW_FRAME already smooths.)"""
     with wave.open(path, "rb") as w:
         rate = w.getframerate(); n = w.getnframes(); ch = w.getnchannels()
         raw = w.readframes(n)
@@ -415,15 +687,16 @@ def channel():
     flash.join()
 
 
-def hold_audience():
-    """One full visitor: greet, grant up to MAX_QUESTIONS, dismiss. Fresh memory each time."""
+def hold_audience(wake_reason):
+    """One full visitor: greet, grant up to MAX_QUESTIONS, dismiss. Fresh memory each time.
+    Returns how many questions were asked (0 = nobody answered the greeting)."""
     history = []                 # wiped per visitor — never bleed one kid into the next
     questions_used = 0
     convo_start = perf_counter()
 
     eyes.color = WAKE_COLOR                     # purple — she stirs
-    print("She wakes and names her terms.")
-    play(GREETING_WAV)
+    print(f"She wakes ({wake_reason}) and names her terms.")
+    play(GREETING_WAVS[wake_reason])
 
     while questions_used < MAX_QUESTIONS:
         if perf_counter() - convo_start > MAX_CONVO_SECONDS:
@@ -496,11 +769,15 @@ def hold_audience():
 
     # How did the audience end?
     if questions_used == 0:
-        pass                                    # nobody spoke — slip back to sleep silently
+        if wake_reason == "persist":            # probably the wind — let her say so
+            eyes.color = SPEAK_COLOR
+            play(WIND_WAV)
+        # otherwise nobody spoke — slip back to sleep silently
     elif questions_used < MAX_QUESTIONS:        # ended early (silence / ceiling) — quick send-off
         eyes.color = SPEAK_COLOR
         play(DISMISS_WAV)
     # else: her final answer already dismissed them — nothing to add.
+    return questions_used
 
 
 # ----------------------------------------------------------------------
@@ -509,8 +786,15 @@ def hold_audience():
 # (Adds a few seconds to startup; it's a one-time cost.)
 # ----------------------------------------------------------------------
 print("Pre-rendering her canned lines...")
-GREETING_WAV = "/tmp/purr_greeting.wav"; synth(GREETING, GREETING_WAV, announce=False)
+# One wav per wake source: opener + shared terms rendered as ONE line, so there's
+# no ffplay gap or jaw seam between them.
+GREETING_WAVS = {}
+for _reason, _opener in OPENERS.items():
+    _p = f"/tmp/purr_greeting_{_reason}.wav"
+    synth(f"{_opener} {TERMS}", _p, announce=False)
+    GREETING_WAVS[_reason] = _p
 DISMISS_WAV  = "/tmp/purr_dismiss.wav";  synth(EARLY_DISMISSAL, DISMISS_WAV, announce=False)
+WIND_WAV     = "/tmp/purr_wind.wav";     synth(WIND_LINE, WIND_WAV, announce=False)
 STALL_WAVS = []
 for _i, _line in enumerate(STALL_LINES):
     _p = f"/tmp/purr_stall_{_i}.wav"
@@ -521,21 +805,45 @@ print("Ready.\n")
 # ----------------------------------------------------------------------
 # Main loop — sleep, wake on motion, hold one audience, re-arm for the next.
 # ----------------------------------------------------------------------
-print("Purrserpina sleeps. Walk up to wake her. (Ctrl+C to stop)\n")
+print("Warming up the PIR — hold still ~30-60s...")
+pir.wait_for_no_motion()
+pir.when_motion    = on_motion           # wire the callbacks only AFTER warm-up,
+pir.when_no_motion = on_no_motion        # so warm-up false triggers aren't logged as dwell
+button.when_pressed = on_button
+
+gate_desc = GATE_MODE if (GATE_MODE != "local" or detector is not None) else "local (UNAVAILABLE -> fail-open)"
+print(f"Purrserpina sleeps. Wake sources: gate={gate_desc} | persistence | button. "
+      "(Ctrl+C to stop)\n")
 try:
     while True:
-        pir.wait_for_motion()
-        hold_audience()
+        reason = wait_for_wake()
+        with state_lock:                     # the guard goes up the instant she decides to wake;
+            awake = True                     # any press that slipped in before this is discarded
+            button_requested = False
+        print(f"\n*** WAKE (wake_reason = {reason}) ***")
+
+        answered = hold_audience(reason)
 
         sleep(0.5)
         eyes.off()                              # back to sleep
-        print("...she sinks back into the dark.\n")
+        print("...she sinks back into the dark.")
 
-        # re-arm: wait for the porch to clear, settle, then accept the next mortal
-        pir.wait_for_no_motion()
-        sleep(COOLDOWN)
+        # A persistence wake nobody answered was probably the wind: rest that path,
+        # longer each time in a row. A real guest (any source) resets the streak.
+        backoff = after_audience(reason, answered)
+        if backoff:
+            print(f"   persistence path backing off {backoff:.0f}s (wind streak {wind_streak})")
+
+        rearm()
+        print("   re-armed, memory blank.\n")
 except KeyboardInterrupt:
     print("\nPurrserpina rests.")
 finally:
     eyes.off()
     jaw.detach()
+    if picam2 is not None:
+        try:
+            picam2.stop()
+            picam2.close()
+        except Exception:
+            pass
