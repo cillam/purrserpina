@@ -264,7 +264,12 @@ if GATE_MODE == "local":
         if Interpreter is None or Image is None:
             raise RuntimeError("ai-edge-litert or PIL not installed")
         labels = [l.strip() for l in LABEL_FILE.read_text().splitlines()]
-        PERSON_ID = labels.index("person")       # some labelmaps start with '???'
+        # The model numbers classes from 0 (0 = person), but this labelmap starts
+        # with a '???' placeholder row. Drop it, or "person" lands on index 1 —
+        # which the model calls BICYCLE, and the gate scores 0.00 forever.
+        if labels and labels[0] == "???":
+            labels = labels[1:]
+        PERSON_ID = labels.index("person")
         detector = Interpreter(model_path=str(MODEL_FILE), num_threads=4)
         detector.allocate_tensors()
         DET_IN  = detector.get_input_details()

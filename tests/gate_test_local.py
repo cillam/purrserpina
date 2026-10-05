@@ -51,7 +51,11 @@ if not MODEL_FILE.exists():
     )
 
 labels = [line.strip() for line in LABEL_FILE.read_text().splitlines()]
-# Some labelmaps start with a '???' placeholder row; find "person" by name.
+# The model numbers classes from 0 (0 = person), but this labelmap starts
+# with a '???' placeholder row. Drop it, or "person" lands on index 1 —
+# which the model calls BICYCLE, and the gate scores 0.00 forever.
+if labels and labels[0] == "???":
+    labels = labels[1:]
 PERSON_ID = labels.index("person")
 
 interpreter = Interpreter(model_path=str(MODEL_FILE), num_threads=4)
